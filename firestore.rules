@@ -1,0 +1,186 @@
+rules_version = '2';
+
+// ============================================================
+// 申請フォームシステム セキュリティルール（Sparkプラン / サーバーなし構成）
+//
+// 考え方
+//  - 申請者IDは20文字のランダム文字列（約100ビット）。
+//    「そのIDを知っていること」が本人確認の代わりになる。
+//  - 一覧取得（list）は管理者だけに許可する。
+//    そのため、IDを知らない人はドキュメントの存在にたどり着けない。
+//  - 申請者は「自分の申請1件」だけを、提出前に限って更新できる。
+//  - 「基本情報」（お客様番号・氏名・電話番号など）は職員だけが読み書きできる。
+//    申請者は自分の申請を get できるため技術的には見えるが、
+//    それは「自分自身の情報が返ってくる」だけであり、他人には見えない。
+//  - 様式によっては、申請者が自分でIDを発行できる（自己受付）。
+//  - 管理者は下の ADMIN_EMAILS に書いたメールアドレスの利用者だけ。
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ▼▼▼ ここを自分の管理者メールアドレスに書き換えてください ▼▼▼
+    function adminEmails() {
+      return [
+        'xxxx@gmail.com'
+      ];
+    }
+    // ▲▲▲ 書き換えたら firebase deploy --only firestore:rules ▲▲▲
+
+    // 申請者IDの形式（20文字・見間違えやすい文字を除いた32種）
+    function isValidApplicantId(id) {
+      return id.matches('^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{20}$');
+    }
+
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && request.auth.token.email.lower() in adminEmails();
+    }
+
+    function formOf(formId) {
+      return get(/databases/$(database)/documents/forms/$(formId)).data;
+    }
+
+    // 1時間あたりに自己発行できる「一時申請ID」の上限（様式ごと・システム全体でこの件数まで）
+    // IPアドレス単位の制限はSparkプラン（Cloud Functionsなし）では実装できないため、
+    // ここでは「様式ごとの時間あたり総発行数」だけを制限している。
+    function HOURLY_ISSUE_LIMIT() {
+      return 100;
+    }
+
+    // 「様式ID + 発行時刻(時間単位)」から時間バケットのドキュメントIDを作る
+    // 例: formId="ab12cd34ef56", 2026-09-17T08:xx:xx → "ab12cd34ef56_2026091708"
+    function rateLimitBucketId(formId, bucketId) {
+      return bucketId.matches('^' + formId + '_[0-9]{10}$');
+    }
+
+    // 受付中かどうか（状態・受付期間）
+    function formIsOpen(formId) {
+      let f = formOf(formId);
+      return f.status == 'active'
+        && f.deleted == false
+        && (f.startsAt == null || request.time >= f.startsAt)
+        && (f.expiresAt == null || request.time <= f.expiresAt);
+    }
+
+    // ------------------------------------------------------------
+    // forms: 申請様式（項目の定義のみ。個人情報は含まない）
+    // ------------------------------------------------------------
+    match /forms/{formId} {
+      // 申請画面が項目定義を読むために get のみ許可する。
+      // list は管理者だけ（＝様式の一覧を外部から取得できない）。
+      // ドキュメントが存在しない場合は resource が null になるため、
+      // 「存在しない様式IDかどうかを確認する」get（様式ID発行時の重複チェック等）も
+      // 許可しておく必要がある（管理者・自己受付どちらも、まずここで新しいIDを試す）。
+      allow get: if resource == null || resource.data.deleted == false;
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------
+    // applicants: 申請者IDごとの申請1件
+    //   { formId, answers{}, submitted, issuedAt, updatedAt, submittedAt, memo,
+    //     basicInfo?: { customerNo, kana, name, phone, addressExtra, confirmedAt } }
+    //
+    //   basicInfo は職員が電話・窓口で本人確認したあとに書き込む欄。
+    //   申請者側の更新（isApplicantEdit）では絶対に触れない。
+    // ------------------------------------------------------------
+    match /applicants/{applicantId} {
+
+      // 申請者本人による更新の条件（basicInfo には一切触れられない）
+      function isApplicantEdit() {
+        let before = resource.data;
+        let after = request.resource.data;
+        return
+          // 提出済みは変更できない
+          before.submitted == false
+          // 受付中の様式であること
+          && formIsOpen(before.formId)
+          // 変更してよいのは以下のフィールドだけ（expireAtは提出時にnullへ解除できる）
+          && after.diff(before).affectedKeys()
+               .hasOnly(['answers', 'submitted', 'updatedAt', 'submittedAt', 'expireAt'])
+          // 所属する様式は変更させない
+          && after.formId == before.formId
+          // 回答は最大60項目のマップ
+          && after.answers is map
+          && after.answers.size() <= 60
+          // submitted は false → true の一方向のみ
+          && after.submitted is bool
+          // expireAtは「そのまま」か「提出に合わせてnullにする」かのどちらかだけ
+          && (after.expireAt == before.expireAt
+              || (after.submitted == true && after.expireAt == null))
+          && after.updatedAt == request.time;
+      }
+
+      // 申請者本人が自分でIDを発行する場合の条件（自己受付。中身は空でなければならない）
+      // 発行と同時に、対応する時間バケット（rateLimits）のカウントを
+      // 同じトランザクション内で1つ増やしていることも条件にする（＝発行数の上限チェック）。
+      function isSelfServiceCreate() {
+        let d = request.resource.data;
+        return isValidApplicantId(applicantId)
+          && formIsOpen(d.formId)
+          && d.answers is map && d.answers.size() == 0
+          && d.submitted == false
+          && d.memo == ''
+          && d.issuedAt == request.time
+          && d.updatedAt == request.time
+          && d.submittedAt == null
+          // 有効期限：発行から最大48時間後までの間であること（未完了データを自動削除するため。既定は24時間後）
+          && d.expireAt is timestamp
+          && d.expireAt > request.time
+          && d.expireAt <= request.time + duration.value(48, 'h')
+          && !('basicInfo' in d)
+          // 同じ様式・同じ時間帯のバケットが上限を超えていないこと。
+          // バケットのカウンタドキュメントは同じトランザクション内でこの直前に
+          // 作成／更新されるため、get()（トランザクション適用前の状態）ではなく
+          // getAfter()（このトランザクションの書き込みをすべて反映した後の状態）を使う。
+          // 初回発行時（バケットがまだ存在しない）に get() を使うと、存在しないドキュメントの
+          // data が null になり、.count へのアクセスでルール評価がエラーになってしまう
+          // （= 呼び出し側には permission-denied として見える）。
+          && d.rateLimitBucket is string
+          && rateLimitBucketId(d.formId, d.rateLimitBucket)
+          && getAfter(/databases/$(database)/documents/rateLimits/$(d.rateLimitBucket)).data.count
+               <= HOURLY_ISSUE_LIMIT();
+      }
+
+      // 申請者IDを知っている本人だけが到達できる（自分の申請が返ってくるだけ）
+      allow get: if true;
+
+      // 一覧・検索は職員だけ
+      allow list: if isAdmin();
+
+      // 発行は「職員」または「本人による自己受付」。削除は職員だけ。
+      allow create: if isAdmin() || isSelfServiceCreate();
+      allow delete: if isAdmin();
+
+      // 更新は「職員（basicInfoも含め何でも可）」または「申請者本人（answers等のみ）」
+      allow update: if isAdmin() || isApplicantEdit();
+    }
+
+    // ------------------------------------------------------------
+    // rateLimits: 「様式ID_時間バケット（YYYYMMDDHH）」ごとの発行カウンタ。
+    //   個人情報は一切含まない。1時間あたりの一時申請ID発行数の上限に使う。
+    // ------------------------------------------------------------
+    match /rateLimits/{bucketId} {
+      allow get: if true;
+      allow list: if isAdmin();
+
+      // 最初の1件目（count=1）としての作成
+      allow create: if request.resource.data.keys().hasOnly(['count', 'expireAt'])
+        && request.resource.data.count == 1
+        && request.resource.data.expireAt is timestamp;
+
+      // 既存バケットのカウントを厳密に+1するだけの更新のみ許可（上限チェックはisSelfServiceCreate側）
+      allow update: if request.resource.data.keys().hasOnly(['count', 'expireAt'])
+        && request.resource.data.count == resource.data.count + 1;
+
+      allow delete: if isAdmin();
+    }
+
+    // 上記以外はすべて拒否
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

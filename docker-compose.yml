@@ -1,0 +1,20 @@
+services:
+  # ビルドやFirebase CLIを実行するための作業用コンテナ。
+  # ホストにNode/npmをインストールしなくても、この中で完結する。
+  dev:
+    image: node:20-bullseye
+    working_dir: /workspace/web
+    volumes:
+      - ./:/workspace
+      # node_modules はコンテナ専用のボリュームに分離する
+      # （Mac側と共有すると壊れることがあるため）
+      - node_modules:/workspace/web/node_modules
+      # firebase login の認証情報を保持する（コンテナを作り直してもログインし直さなくて済む）
+      - firebase_config:/root/.config/configstore
+    # コンテナを起動したままにして、docker compose exec で操作する
+    command: sleep infinity
+    tty: true
+
+volumes:
+  node_modules:
+  firebase_config:
